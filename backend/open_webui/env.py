@@ -26,6 +26,8 @@ print(BASE_DIR)
 
 try:
     from dotenv import find_dotenv, load_dotenv
+    print("Loading .env file")
+    print(str(BASE_DIR / ".env"))
 
     load_dotenv(find_dotenv(str(BASE_DIR / ".env")))
 except ImportError:

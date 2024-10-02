@@ -3,7 +3,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Literal, Optional, overload
+from typing import Literal, Optional, overload, AsyncGenerator
 
 import aiohttp
 import requests
@@ -19,6 +19,7 @@ from open_webui.config import (
     OPENAI_API_KEYS,
     AppConfig,
 )
+from typing import Dict, Any
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.env import SRC_LOG_LEVELS
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -196,8 +197,24 @@ async def cleanup_response(
     response: Optional[aiohttp.ClientResponse],
     session: Optional[aiohttp.ClientSession],
 ):
+    print("cleanup_response")
+    print(response)
+    print(session)
     if response:
-        response.close()
+        # Check if the response is a tool call
+        is_tool_call = False
+        if response.headers.get("Content-Type") == "application/json":
+            try:
+                data = await response.json()
+                if 'choices' in data and data['choices']:
+                    delta = data['choices'][0].get('delta', {})
+                    if 'tool_calls' in delta:
+                        is_tool_call = True
+            except:
+                pass
+
+        if not is_tool_call:
+            response.close()
     if session:
         await session.close()
 
@@ -369,7 +386,165 @@ async def get_models(url_idx: Optional[int] = None, user=Depends(get_verified_us
                 detail=error_detail,
             )
 
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_weather",
+            "description": "Get the current weather in a given location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city and state, e.g. San Francisco, CA",
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                    },
+                },
+                "required": ["location"],
+            },
+        },
+    }
+]
 
+async def execute_tool_call(tool_call: Dict[str, Any], arguments: str) -> Dict[str, Any]:
+    try:
+        args = json.loads(arguments)
+        log.debug(f"Parsed arguments: {args}")
+        if tool_call['function']['name'] == 'get_current_weather':
+            weather_info = await get_weather(args['location'], args.get('unit', 'celsius'))
+            return {
+                "tool_call_id": tool_call.get('id', 'unknown'),
+                "role": "tool",
+                "name": "get_current_weather",
+                "content": weather_info
+            }
+    except json.JSONDecodeError:
+        log.error(f"Failed to parse arguments: {arguments}")
+    except KeyError as e:
+        log.error(f"KeyError in tool call arguments: {e}")
+    except Exception as e:
+        log.error(f"Error executing tool call: {str(e)}")
+    return None
+
+async def send_follow_up_request(url: str, headers: Dict[str, str], messages: list, model: str) -> AsyncGenerator[str, None]:
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "tools": TOOLS,  # Include tool definitions
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(f"{url}/chat/completions", headers=headers, json=payload) as response:
+            async for line in response.content:
+                if line:
+                    line = line.decode('utf-8').strip()
+                    if line.startswith("data: "):
+                        line = line[6:]
+                    if line == "[DONE]":
+                        yield line
+                        return
+                    try:
+                        yield line
+                    except json.JSONDecodeError:
+                        log.error(f"Failed to parse JSON: {line}")
+
+async def process_stream(url: str, headers: Dict[str, str], payload: str):
+    log.info(f"Starting process_stream with URL: {url}")
+    payload_json = json.loads(payload)
+    model = payload_json.get("model")
+    messages = payload_json.get("messages", [])
+    
+    # Add tools to the payload if not already present
+    if "tools" not in payload_json:
+        payload_json["tools"] = TOOLS
+        payload = json.dumps(payload_json)
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(f"{url}/chat/completions", headers=headers, data=payload) as response:
+            log.info(f"Response status: {response.status}")
+            current_tool_calls = []
+            accumulated_json = ""
+            accumulated_content = ""
+            
+            async for line in response.content:
+                if line:
+                    line = line.decode('utf-8').strip()
+                    log.debug(f"Received line: {line}")
+                    
+                    if line == ': OPENROUTER PROCESSING':
+                        continue
+                    
+                    if line.startswith('data: '):
+                        line = line[6:]  # Remove 'data: ' prefix
+                    
+                    if line == '[DONE]':
+                        log.info("Received [DONE] signal")
+                        if current_tool_calls:
+                            log.info("Executing final tool calls before completion")
+                            assistant_message = {"role": "assistant", "content": accumulated_content, "tool_calls": current_tool_calls}
+                            messages.append(assistant_message)
+                            
+                            tool_outputs = []
+                            for tool_call in current_tool_calls:
+                                tool_response = await execute_tool_call(tool_call, tool_call['function']['arguments'])
+                                if tool_response:
+                                    tool_outputs.append(tool_response)
+                            
+                            if tool_outputs:
+                                messages.extend(tool_outputs)
+                                
+                            async for chunk in send_follow_up_request(url, headers, messages, model):
+                                yield f"data: {chunk}\n\n"
+                        elif accumulated_content:
+                            messages.append({"role": "assistant", "content": accumulated_content})
+                        yield f"data: [DONE]\n\n"
+                        return
+                    
+                    try:
+                        event = json.loads(line)
+                        log.debug(f"Parsed event: {event}")
+                        
+                        if 'choices' in event and event['choices']:
+                            delta = event['choices'][0].get('delta', {})
+                            log.debug(f"Delta: {delta}")
+                            if 'tool_calls' in delta:
+                                tool_calls = delta['tool_calls']
+                                log.info(f"Received tool calls: {tool_calls}")
+                                for tool_call in tool_calls:
+                                    if 'function' in tool_call:
+                                        if tool_call.get('index', 0) >= len(current_tool_calls):
+                                            current_tool_calls.append(tool_call)
+                                        else:
+                                            current_tool_calls[tool_call['index']]['function']['arguments'] += tool_call['function'].get('arguments', '')
+                            elif 'content' in delta:
+                                content = delta['content']
+                                log.debug(f"Received content: {content}")
+                                accumulated_content += content
+                            yield f"data: {json.dumps(event)}\n\n"
+                        else:
+                            log.debug("No choices in event, passing through")
+                            yield f"data: {json.dumps(event)}\n\n"
+                    except json.JSONDecodeError:
+                        log.debug(f"Invalid JSON, accumulating: {line}")
+                        accumulated_json += line
+                    except Exception as e:
+                        log.error(f"Error processing stream: {str(e)}")
+                        yield f"data: {{\"error\": \"{str(e)}\"}}\n\n"
+                        accumulated_json = ""
+    
+    log.info("Finished processing stream")
+
+# The get_weather function remains unchanged
+async def get_weather(location: str, unit: str) -> str:
+    log.info(f"get_weather called with location: {location}, unit: {unit}")
+    weather_info = f"Weather in {location}: 22°{'F' if unit == 'fahrenheit' else 'C'}"
+    log.info(f"Returning weather info: {weather_info}")
+    return weather_info
+    
 @app.post("/chat/completions")
 @app.post("/chat/completions/{url_idx}")
 async def generate_chat_completion(
@@ -438,52 +613,59 @@ async def generate_chat_completion(
     streaming = False
     response = None
 
+
+    session = aiohttp.ClientSession(
+        trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+        )
+
+
+    custom_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_current_weather",
+                "description": "Get the current weather in a given location",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "The city and state, e.g. San Francisco, CA",
+                        },
+                        "unit": {
+                            "type": "string",
+                            "enum": ["celsius", "fahrenheit"],
+                        },
+                    },
+                    "required": ["location"],
+                },
+            },
+        }
+    ]
+    payload_json = json.loads(payload)  
+    payload_json["tools"] = custom_tools
+    payload_json["tool_choice"] = "auto"    
+    payload = json.dumps(payload_json)
+
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    if "openrouter.ai" in url:
+        headers["HTTP-Referer"] = "https://openwebui.com/"
+        headers["X-Title"] = "Open WebUI"
+
+
+
+    #return StreamingResponse(process_stream(url, headers, payload), media_type="text/event-stream")
     try:
-        session = aiohttp.ClientSession(
-            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-        )
-        r = await session.request(
-            method="POST",
-            url=f"{url}/chat/completions",
-            data=payload,
-            headers=headers,
-        )
-
-        # Check if response is SSE
-        if "text/event-stream" in r.headers.get("Content-Type", ""):
-            streaming = True
-            return StreamingResponse(
-                r.content,
-                status_code=r.status,
-                headers=dict(r.headers),
-                background=BackgroundTask(
-                    cleanup_response, response=r, session=session
-                ),
-            )
-        else:
-            try:
-                response = await r.json()
-            except Exception as e:
-                log.error(e)
-                response = await r.text()
-
-            r.raise_for_status()
-            return response
-    except Exception as e:
-        log.exception(e)
-        error_detail = "Open WebUI: Server Connection Error"
-        if isinstance(response, dict):
-            if "error" in response:
-                error_detail = f"{response['error']['message'] if 'message' in response['error'] else response['error']}"
-        elif isinstance(response, str):
-            error_detail = response
-
-        raise HTTPException(status_code=r.status if r else 500, detail=error_detail)
+        return StreamingResponse(process_stream(url, headers, payload), media_type="text/event-stream")
     finally:
-        if not streaming and session:
-            if r:
-                r.close()
+        # Ensure the session is closed
+        if 'session' in locals():
             await session.close()
+    
+   
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
